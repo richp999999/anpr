@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+
+# Preferred plate detection/OCR pipeline (pretrained, no training needed):
+fast-alpr
+
+# Fallback pipeline, used automatically only if fast-alpr isn't installed:
+opencv-python-headless
+pytesseract
+# Also requires the tesseract-ocr binary on the host, e.g.:
+#   sudo apt-get update && sudo apt-get install -y tesseract-ocr
