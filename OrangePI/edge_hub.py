@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import os
 import sqlite3
@@ -8,6 +7,7 @@ import threading
 import time
 import random
 import urllib.request
+import urllib.parse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -19,6 +19,10 @@ app = FastAPI()
 DB_PATH = "local_anpr.db"
 CONFIG_PATH = "edge_config.json"
 
+# How often this hub pings the central broker to prove it's still online.
+# The central server drops any hub that goes 10 minutes without a heartbeat.
+KEEP_ALIVE_INTERVAL_SECONDS = 300  # 5 minutes
+
 # ================================================================================
 # DEFAULT HARDWARE CONFIGURATION PROFILE
 # ================================================================================
@@ -29,7 +33,10 @@ DEFAULT_CONFIG = {
     "cam2_url": "rtsp://admin:securepass1@192.168.1.56:554/h264Preview_01_sub",
     "server_sync_enabled": True,
     "server_url": "http://localhost:8000/api/v1/anpr/ingest",
-    "server_token": "hub-bham-north"
+    "server_token": "hub-bham-north",
+    "hub_name": "Birmingham North Gate",
+    "hub_latitude": 52.4862,
+    "hub_longitude": -1.8904
 }
 
 def load_config():
@@ -91,6 +98,61 @@ def transmit_payload_to_central_server(url, token, plate, confidence, timestamp)
     # 3 second maximum connection timeout to prevent hanging the edge detection thread
     with urllib.request.urlopen(req, timeout=3) as response:
         return response.status == 200 or response.status == 201
+
+
+def get_hub_management_base_url(ingest_url):
+    """Derives the central broker's base URL (scheme + host) from the configured plate
+    ingest endpoint, so the registration and heartbeat calls always target the same server."""
+    parsed = urllib.parse.urlparse(ingest_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def register_hub_with_central_server(base_url, token, name, latitude, longitude):
+    """Registers (or re-registers) this hub's identity with the central broker."""
+    payload = {"id": token, "name": name, "latitude": latitude, "longitude": longitude}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/api/v1/hubs/register", data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=3) as response:
+        return response.status in (200, 201)
+
+
+def send_keep_alive_ping(base_url, token):
+    """Sends a lightweight heartbeat so the central broker knows this hub is still online."""
+    req = urllib.request.Request(f"{base_url}/api/v1/hubs/keepalive", method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=3) as response:
+        return response.status == 200
+
+
+def background_keep_alive_worker():
+    """Registers this hub with the central broker on startup, then pings it every 5 minutes
+    so the server's 10-minute inactivity timeout never trips while this hub is actually
+    online. If a heartbeat is rejected (e.g. the hub had already been dropped for going
+    quiet too long), it transparently re-registers before retrying."""
+    global current_config
+    while True:
+        if current_config.get("server_sync_enabled"):
+            try:
+                base_url = get_hub_management_base_url(current_config["server_url"])
+                send_keep_alive_ping(base_url, current_config["server_token"])
+            except Exception:
+                # Most likely this hub isn't registered yet, or was dropped for inactivity.
+                # Re-register, then retry the heartbeat once before giving up for this cycle.
+                try:
+                    base_url = get_hub_management_base_url(current_config["server_url"])
+                    register_hub_with_central_server(
+                        base_url,
+                        current_config["server_token"],
+                        current_config.get("hub_name", current_config["server_token"]),
+                        current_config.get("hub_latitude", 0.0),
+                        current_config.get("hub_longitude", 0.0),
+                    )
+                    send_keep_alive_ping(base_url, current_config["server_token"])
+                except Exception:
+                    # Central server unreachable this cycle; will retry automatically next cycle
+                    pass
+        time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 
 def background_cache_sync_worker():
@@ -183,6 +245,7 @@ def camera_anpr_inference_simulator():
                 pass
 
 # Initialize edge daemon runtimes asynchronously
+threading.Thread(target=background_keep_alive_worker, daemon=True).start()
 threading.Thread(target=background_cache_sync_worker, daemon=True).start()
 threading.Thread(target=camera_anpr_inference_simulator, daemon=True).start()
 
@@ -198,6 +261,9 @@ class EdgeConfigSchema(BaseModel):
     server_sync_enabled: bool
     server_url: str
     server_token: str
+    hub_name: str = "Edge Hub"
+    hub_latitude: float = 0.0
+    hub_longitude: float = 0.0
 
 
 @app.get("/api/config")
@@ -358,6 +424,17 @@ async def serve_edge_administration_panel():
                         </div>
                         <hr class="border-slate-800">
                         <div>
+                            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Hub Identity &amp; Location</label>
+                            <div class="flex flex-col gap-2">
+                                <input type="text" id="hub-name" placeholder="Hub display name" class="w-full text-xs font-mono bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-slate-200 focus:outline-none">
+                                <div class="grid grid-cols-2 gap-2">
+                                    <input type="number" step="any" id="hub-latitude" placeholder="Latitude" class="w-full text-xs font-mono bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-slate-200 focus:outline-none">
+                                    <input type="number" step="any" id="hub-longitude" placeholder="Longitude" class="w-full text-xs font-mono bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-slate-200 focus:outline-none">
+                                </div>
+                            </div>
+                        </div>
+                        <hr class="border-slate-800">
+                        <div>
                             <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Local Storage Mode</label>
                             <div class="bg-slate-950 border border-slate-800 rounded-xl p-3 flex justify-between items-center">
                                 <div><div class="text-xs font-medium text-slate-200">Local DB Storage</div><div class="text-[10px] text-slate-500">Always active to secure captures safely</div></div>
@@ -369,7 +446,7 @@ async def serve_edge_administration_panel():
                             <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">Central Server Sync Pipeline</label>
                             <div class="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col gap-3">
                                 <div class="flex items-center justify-between">
-                                    <div><div class="text-xs font-semibold text-slate-200">Immediate Cloud Upload</div><div class="text-[10px] text-slate-400">Stream records to server instantly when available</div></div>
+                                    <div><div class="text-xs font-semibold text-slate-200">Immediate Cloud Upload</div><div class="text-[10px] text-slate-400">Stream records to server instantly when available. Also drives the 5-minute keep-alive heartbeat.</div></div>
                                     <label class="relative inline-flex items-center cursor-pointer">
                                         <input type="checkbox" id="server-sync-enabled" class="sr-only peer">
                                         <div class="w-8 h-4 bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-400 after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-orange-500 peer-checked:after:bg-white"></div>
@@ -448,6 +525,9 @@ async def serve_edge_administration_panel():
             document.getElementById("server-sync-enabled").checked = data.server_sync_enabled;
             document.getElementById("server-url").value = data.server_url;
             document.getElementById("server-token").value = data.server_token;
+            document.getElementById("hub-name").value = data.hub_name || "";
+            document.getElementById("hub-latitude").value = data.hub_latitude ?? "";
+            document.getElementById("hub-longitude").value = data.hub_longitude ?? "";
         }
 
         async function saveEdgeConfigForm() {
@@ -458,7 +538,10 @@ async def serve_edge_administration_panel():
                 cam2_url: document.getElementById("cam2-url").value,
                 server_sync_enabled: document.getElementById("server-sync-enabled").checked,
                 server_url: document.getElementById("server-url").value,
-                server_token: document.getElementById("server-token").value
+                server_token: document.getElementById("server-token").value,
+                hub_name: document.getElementById("hub-name").value,
+                hub_latitude: parseFloat(document.getElementById("hub-latitude").value) || 0.0,
+                hub_longitude: parseFloat(document.getElementById("hub-longitude").value) || 0.0
             };
             let res = await fetch("/api/config", {
                 method: "POST",

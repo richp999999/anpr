@@ -2,6 +2,8 @@
 import os
 import sqlite3
 import datetime
+import threading
+import time
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -13,6 +15,11 @@ app = FastAPI()
 # Persistent Engine Storage Configurations (No indentation requirements to prevent scope pitfalls)
 os.makedirs("data", exist_ok=True)
 DB_PATH = os.path.join("data", "central_anpr.db")
+
+# Edge hubs that go this long without registering, ingesting a plate, or sending a
+# heartbeat are considered offline and are dropped from the active hub registry.
+HUB_INACTIVITY_TIMEOUT_SECONDS = 600  # 10 minutes
+STALE_HUB_SWEEP_INTERVAL_SECONDS = 60  # Check once a minute
 
 
 def init_db():
@@ -27,9 +34,16 @@ def init_db():
             name TEXT NOT NULL,
             latitude REAL NOT NULL,
             longitude REAL NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            last_seen TEXT
         );
     """)
+
+    # Migration guard: older database files created before the heartbeat column existed
+    try:
+        cursor.execute("ALTER TABLE hubs ADD COLUMN last_seen TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already present on this database file
     
     # 2. Aggregated Trace Metadata Table Log
     cursor.execute("""
@@ -48,9 +62,9 @@ def init_db():
     if cursor.fetchone()[0] == 0:
         now_string = datetime.datetime.now().isoformat()
         
-        # Seed example remote Hub nodes
-        cursor.execute("INSERT INTO hubs VALUES (?, ?, ?, ?, ?)", ("hub-bham-north", "Birmingham North Gate", 52.4862, -1.8904, now_string))
-        cursor.execute("INSERT INTO hubs VALUES (?, ?, ?, ?, ?)", ("hub-london-m25", "London Orbital Checkpoint", 51.5074, -0.1278, now_string))
+        # Seed example remote Hub nodes (last_seen set to "now" so they start out active)
+        cursor.execute("INSERT INTO hubs (id, name, latitude, longitude, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", ("hub-bham-north", "Birmingham North Gate", 52.4862, -1.8904, now_string, now_string))
+        cursor.execute("INSERT INTO hubs (id, name, latitude, longitude, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", ("hub-london-m25", "London Orbital Checkpoint", 51.5074, -0.1278, now_string, now_string))
         
         # Seed matching historical records matching August 2026 contexts
         cursor.execute("INSERT INTO plates (hub_id, plate, confidence, timestamp) VALUES (?, ?, ?, ?)", ("hub-bham-north", "GB26 XTR", 94.5, "2026-08-15T12:15:00"))
@@ -63,6 +77,30 @@ def init_db():
 
 # Fire Schema Allocation Routines on application loader cycle
 init_db()
+
+
+# ================================================================================
+# BACKGROUND HEARTBEAT EXPIRY SWEEPER
+# ================================================================================
+def background_stale_hub_reaper():
+    """Periodically drops edge hubs that have gone quiet for longer than the inactivity
+    timeout, so the active hub registry only ever reflects nodes that are actually still
+    checking in. Historical plate reads already ingested are left untouched."""
+    while True:
+        time.sleep(STALE_HUB_SWEEP_INTERVAL_SECONDS)
+        try:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(seconds=HUB_INACTIVITY_TIMEOUT_SECONDS)).isoformat()
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM hubs WHERE last_seen IS NOT NULL AND last_seen < ?", (cutoff,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            # Sweep failed this cycle (e.g. DB momentarily busy); retry on the next tick
+            pass
+
+
+threading.Thread(target=background_stale_hub_reaper, daemon=True).start()
 
 
 # ================================================================================
@@ -95,19 +133,45 @@ async def register_hub_account(payload: HubRegistrationSchema):
         now_string = datetime.datetime.now().isoformat()
         
         cursor.execute("""
-            INSERT INTO hubs (id, name, latitude, longitude, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO hubs (id, name, latitude, longitude, created_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 latitude = excluded.latitude,
-                longitude = excluded.longitude;
-        """, (payload.id, payload.name, payload.latitude, payload.longitude, now_string))
+                longitude = excluded.longitude,
+                last_seen = excluded.last_seen;
+        """, (payload.id, payload.name, payload.latitude, payload.longitude, now_string, now_string))
         
         conn.commit()
         conn.close()
         return JSONResponse(status_code=201, content={"status": "Success", "message": f"Account profile mapping locked for terminal ID: '{payload.id}'."})
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"Database pipeline failure: {str(err)}")
+
+
+@app.post("/api/v1/hubs/keepalive")
+async def hub_keep_alive_ping(authorization: str = Header(None)):
+    """Lightweight heartbeat endpoint that edge hubs call periodically to prove they're
+    still online, refreshing their last_seen timestamp and resetting their inactivity clock."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization bearer credentials header context.")
+    
+    extracted_hub_id = authorization.split(" ")[1]
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM hubs WHERE id = ?", (extracted_hub_id,))
+    hub_exists = cursor.fetchone()
+    
+    if not hub_exists:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Hub '{extracted_hub_id}' is not currently registered. Register before sending heartbeats.")
+    
+    now_string = datetime.datetime.now().isoformat()
+    cursor.execute("UPDATE hubs SET last_seen = ? WHERE id = ?", (now_string, extracted_hub_id))
+    conn.commit()
+    conn.close()
+    return {"status": "Alive", "hub_id": extracted_hub_id, "last_seen": now_string}
 
 
 @app.post("/api/v1/anpr/ingest")
@@ -128,10 +192,13 @@ async def ingest_plate_records(payload: PlateIngestionSchema, authorization: str
         raise HTTPException(status_code=403, detail=f"Access denied: No active server account profile allocated for token ID '{extracted_hub_id}'.")
     
     try:
+        now_string = datetime.datetime.now().isoformat()
         cursor.execute("""
             INSERT INTO plates (hub_id, plate, confidence, timestamp)
             VALUES (?, ?, ?, ?);
         """, (extracted_hub_id, payload.plate.upper().strip(), payload.confidence, payload.timestamp))
+        # Any successful ingest also counts as proof of life, so refresh the heartbeat clock
+        cursor.execute("UPDATE hubs SET last_seen = ? WHERE id = ?", (now_string, extracted_hub_id))
         
         conn.commit()
         conn.close()
@@ -159,7 +226,7 @@ async def serve_admin_dashboard_console():
     plate_count = cursor.fetchone()['total']
     
     cursor.execute("""
-        SELECT h.id, h.name, h.latitude, h.longitude, COUNT(p.id) as volumes 
+        SELECT h.id, h.name, h.latitude, h.longitude, h.last_seen, COUNT(p.id) as volumes 
         FROM hubs h 
         LEFT JOIN plates p ON h.id = p.hub_id 
         GROUP BY h.id 
@@ -167,24 +234,46 @@ async def serve_admin_dashboard_console():
     """)
     hubs_rows = cursor.fetchall()
     
+    # LEFT JOIN (not INNER JOIN) so historical plate reads survive even after their hub
+    # has since been dropped from the active registry for going quiet too long.
     cursor.execute("""
-        SELECT p.timestamp, p.plate, p.confidence, h.name as hub_name 
+        SELECT p.timestamp, p.plate, p.confidence, COALESCE(h.name, p.hub_id) as hub_name 
         FROM plates p 
-        JOIN hubs h ON p.hub_id = h.id 
+        LEFT JOIN hubs h ON p.hub_id = h.id 
         ORDER BY p.timestamp DESC, p.id DESC 
         LIMIT 50
     """)
     plates_rows = cursor.fetchall()
     conn.close()
 
+    now_dt = datetime.datetime.now()
+
+    def format_last_seen(raw_last_seen):
+        if not raw_last_seen:
+            return "Never", "text-slate-500"
+        try:
+            seen_dt = datetime.datetime.fromisoformat(raw_last_seen)
+        except ValueError:
+            return "Unknown", "text-slate-500"
+        seconds_ago = max(0, int((now_dt - seen_dt).total_seconds()))
+        if seconds_ago < 60:
+            label = f"{seconds_ago}s ago"
+        else:
+            label = f"{seconds_ago // 60}m ago"
+        # Flag hubs approaching the 10-minute expiry window in amber
+        color = "text-amber-400" if seconds_ago > (HUB_INACTIVITY_TIMEOUT_SECONDS * 0.66) else "text-emerald-400"
+        return label, color
+
     hubs_table_html = ""
     for hub in hubs_rows:
+        last_seen_label, last_seen_color = format_last_seen(hub['last_seen'])
         hubs_table_html += f"""
         <tr class="border-b border-slate-800 hover:bg-slate-800/20 font-mono text-xs text-slate-300 transition-colors">
             <td class="px-6 py-4 font-bold text-orange-400">{hub['id']}</td>
             <td class="px-6 py-4 font-sans text-slate-200">{hub['name']}</td>
             <td class="px-6 py-4 text-cyan-400">{hub['latitude']:.4f}, {hub['longitude']:.4f}</td>
             <td class="px-6 py-4 font-bold text-slate-400">{hub['volumes']:,} rows</td>
+            <td class="px-6 py-4 font-semibold {last_seen_color}">{last_seen_label}</td>
         </tr>
         """
 
@@ -235,6 +324,7 @@ async def serve_admin_dashboard_console():
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl flex flex-col gap-1 shadow-sm">
                 <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Registered Terminal Hubs</div>
                 <div class="text-2xl font-black text-orange-500 font-mono mt-1">{hub_count} Accounts</div>
+                <div class="text-[10px] text-slate-500 mt-0.5">Auto-dropped after 10 min of silence</div>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl flex flex-col gap-1 shadow-sm">
                 <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Aggregated Global Ingest</div>
@@ -259,6 +349,7 @@ async def serve_admin_dashboard_console():
                                 <th class="px-6 py-3">Location Name</th>
                                 <th class="px-6 py-3">GPS Tracking</th>
                                 <th class="px-6 py-3">Ingested</th>
+                                <th class="px-6 py-3">Last Seen</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-800/40">
